@@ -1050,6 +1050,10 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        # Extract tree rollout metrics and forward to wandb/logger
+                        _tree_m = gen_batch_output.meta_info.pop("tree_metrics", {})
+                        if _tree_m:
+                            metrics.update(_tree_m)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:

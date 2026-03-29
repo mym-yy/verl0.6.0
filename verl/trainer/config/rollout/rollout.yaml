@@ -271,6 +271,24 @@ skip_dump_dir: /tmp/rollout_dump
 # When enabled (True), the rollout assume token in token out for generation
 skip_tokenizer_init: True
 
+# Tree search (tree decoding) configuration for vLLM rollout
+tree_search:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.TreeSearchConfig
+
+  # Whether to enable tree search during rollout
+  enable: False
+
+  # Entropy threshold above which branching is triggered
+  entropy_threshold: 1.0
+
+  # Number of branches to create at each branching point
+  branching_factor: 3
+
+  # Maximum depth of the tree
+  max_tree_depth: 3
+
 # profile the rollout model in `generate_sequence` 
 profiler:
 

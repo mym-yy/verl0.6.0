@@ -27,6 +27,7 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
+    "TreeSearchConfig",
     "RolloutConfig",
 ]
 
@@ -89,6 +90,16 @@ class ServerConfig(BaseConfig):
     retry_delay: float = 2.0
     max_connections: int = 1000
     max_start_wait_time: float = 300.0
+
+
+@dataclass
+class TreeSearchConfig(BaseConfig):
+    """Configuration for vLLM tree search (tree decoding) rollout."""
+
+    enable: bool = False
+    entropy_threshold: float = 1.0
+    branching_factor: int = 3
+    max_tree_depth: int = 3
 
 
 @dataclass
@@ -159,6 +170,8 @@ class RolloutConfig(BaseConfig):
     skip_rollout: bool = False
 
     skip_dump_dir: str = "/tmp/rollout_dump"
+
+    tree_search: TreeSearchConfig = field(default_factory=TreeSearchConfig)
 
     profiler: Optional[ProfilerConfig] = None
 

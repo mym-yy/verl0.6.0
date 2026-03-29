@@ -52,6 +52,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
 from vllm.lora.request import LoRARequest
+from vllm.sampling_params import TreeSearchParams
 
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
@@ -230,6 +231,17 @@ class vLLMRollout(BaseRollout):
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
+        # Tree search params — read from rollout config's tree_search sub-config
+        _tree_cfg = config.get("tree_search", None)
+        if _tree_cfg is not None and _tree_cfg.get("enable", False):
+            self.sampling_params.tree_search_params = TreeSearchParams(
+                enable_tree_search=True,
+                entropy_threshold=float(_tree_cfg.get("entropy_threshold", 1.0)),
+                branching_factor=int(_tree_cfg.get("branching_factor", 3)),
+                max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
+            )
+            logging.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
+
         self.pad_token_id = tokenizer.pad_token_id
 
     @contextmanager
@@ -340,6 +352,7 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # users can customize different sampling_params at different run
+        _tree_metrics: dict = {}
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
@@ -362,6 +375,23 @@ class vLLMRollout(BaseRollout):
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
+
+            # Tree rollout metrics: aggregate across all requests in this batch
+            _tree_total, _tree_leaves, _tree_depth_sum = 0, 0, 0
+            for _out in outputs:
+                _seqs = _out.outputs
+                _tree_total += len(_seqs)
+                _tree_leaves += sum(1 for _s in _seqs if _s.is_leaf)
+                _tree_depth_sum += max((_s.tree_depth for _s in _seqs), default=0)
+            _tree_branch_pts = _tree_total - _tree_leaves
+            _tree_metrics = {
+                "tree/total_nodes": _tree_total,
+                "tree/leaf_nodes": _tree_leaves,
+                "tree/branch_points": _tree_branch_pts,
+                "tree/branching_rate": round(_tree_branch_pts / max(_tree_total, 1), 4),
+                "tree/avg_max_depth": round(_tree_depth_sum / max(len(outputs), 1), 4),
+            }
+            logging.info(f"[TreeRollout] step metrics: {_tree_metrics}")
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
@@ -406,7 +436,7 @@ class vLLMRollout(BaseRollout):
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"tree_metrics": _tree_metrics})
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

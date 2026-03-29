@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7b-MATH-0527a1'
+exp_name='DAPO-withoutds'
 
 adv_estimator=grpo
 

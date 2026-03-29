@@ -61,7 +61,15 @@ class Tracking:
         self.logger = {}
 
         if "tracking" in default_backend or "wandb" in default_backend:
+            import os
             import wandb
+
+            # Ray workers do NOT inherit the shell's env_vars unless explicitly listed in
+            # runtime_env.env_vars. Call wandb.login() with the key from the environment
+            # (which may come from WANDB_API_KEY or WANDB_KEY) so that no-TTY workers work.
+            _wandb_key = os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_KEY")
+            if _wandb_key:
+                wandb.login(key=_wandb_key, relogin=True)
 
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):

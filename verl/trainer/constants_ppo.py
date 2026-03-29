@@ -49,4 +49,11 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+
+    # Forward wandb credentials to Ray workers (workers do not inherit the caller's env).
+    for _wandb_var in ("WANDB_API_KEY", "WANDB_KEY", "WANDB_MODE", "WANDB_DIR"):
+        _val = os.environ.get(_wandb_var)
+        if _val:
+            runtime_env["env_vars"][_wandb_var] = _val
+
     return runtime_env
