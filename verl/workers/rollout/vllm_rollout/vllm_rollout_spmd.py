@@ -376,13 +376,44 @@ class vLLMRollout(BaseRollout):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
 
-            # Tree rollout metrics: aggregate across all requests in this batch
+            # === RESTORED ORIGINAL TREE METRICS + DETAILED DEBUG ===
+            # This is your original logic before we simplified it.
             _tree_total, _tree_leaves, _tree_depth_sum = 0, 0, 0
-            for _out in outputs:
+            debug_samples = []
+
+            for out_idx, _out in enumerate(outputs):
                 _seqs = _out.outputs
-                _tree_total += len(_seqs)
-                _tree_leaves += sum(1 for _s in _seqs if _s.is_leaf)
-                _tree_depth_sum += max((_s.tree_depth for _s in _seqs), default=0)
+                seq_count = len(_seqs)
+                _tree_total += seq_count
+
+                leaf_count = 0
+                depths = []
+                for s_idx, _s in enumerate(_seqs):
+                    is_leaf_val = getattr(_s, 'is_leaf', 'MISSING')
+                    depth_val = getattr(_s, 'tree_depth', 'MISSING')
+                    if is_leaf_val is True or str(is_leaf_val).lower() == 'true':
+                        leaf_count += 1
+                    if isinstance(depth_val, (int, float)):
+                        depths.append(depth_val)
+
+                _tree_leaves += leaf_count
+                if depths:
+                    _tree_depth_sum += max(depths)
+
+                # Record debug for first 2 outputs
+                if out_idx < 2 and _seqs:
+                    debug_samples.append({
+                        "out_idx": out_idx,
+                        "num_seqs": seq_count,
+                        "leaf_count": leaf_count,
+                        "depths": depths[:5],  # first 5 depths
+                        "sample0": {
+                            "is_leaf": getattr(_seqs[0], 'is_leaf', 'MISSING'),
+                            "tree_depth": getattr(_seqs[0], 'tree_depth', 'MISSING'),
+                            "type": type(_seqs[0]).__name__
+                        }
+                    })
+
             _tree_branch_pts = _tree_total - _tree_leaves
             _tree_metrics = {
                 "tree/total_nodes": _tree_total,
@@ -392,6 +423,9 @@ class vLLMRollout(BaseRollout):
                 "tree/avg_max_depth": round(_tree_depth_sum / max(len(outputs), 1), 4),
             }
             logging.info(f"[TreeRollout] step metrics: {_tree_metrics}")
+            
+            if debug_samples:
+                logging.info(f"[TreeRollout] DEBUG INFO: {debug_samples}")
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device

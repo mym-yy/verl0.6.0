@@ -2,6 +2,7 @@ set -x
 # Save login home before HOME is overridden (otherwise ~/.wandb_api_key would be wrong).
 _ORIG_HOME="${HOME}"
 
+export PYTHONUNBUFFERED=1
 export VERL_DEBUG_LOG_PATH=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
@@ -15,6 +16,9 @@ TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 LOG_DIR="${HOME}/logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
+
+echo "=== Training started at $(date) ===" | tee -a "${LOG_FILE}"
+echo "Log file: ${LOG_FILE}" | tee -a "${LOG_FILE}"
 
 
 # WANDB: must be set before Ray (no TTY). Order matters — do not `exit 1` before loading key.
@@ -81,6 +85,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    reward_model.reward_manager=dapo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
@@ -90,4 +95,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
-    trainer.total_epochs=1 $@ 2>&1 | tee "${LOG_FILE}"
+    trainer.total_epochs=1 \
+    actor_rollout_ref.rollout.val_kwargs.n=4 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    $@ 2>&1 | tee -a "${LOG_FILE}"
