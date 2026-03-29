@@ -90,12 +90,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
     trainer.project_name='verl_grpo_treerollout' \
-    trainer.experiment_name='qwen2.5_0.5b_test' \
+    trainer.experiment_name='qwen3_8b_test' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    actor_rollout_ref.rollout.val_kwargs.n=4 \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     $@ 2>&1 | tee -a "${LOG_FILE}"
