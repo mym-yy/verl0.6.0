@@ -56,4 +56,9 @@ def get_ppo_ray_runtime_env():
         if _val:
             runtime_env["env_vars"][_wandb_var] = _val
 
+    # verl rollout uses logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN")); forward so [TreeRollout] INFO appears in worker logs.
+    _verl_log = os.environ.get("VERL_LOGGING_LEVEL")
+    if _verl_log:
+        runtime_env["env_vars"]["VERL_LOGGING_LEVEL"] = _verl_log
+
     return runtime_env

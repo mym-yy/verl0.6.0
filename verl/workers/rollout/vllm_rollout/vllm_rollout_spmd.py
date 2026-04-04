@@ -29,6 +29,7 @@ When working with Megatron:
 import asyncio
 import getpass
 import inspect
+import json
 import logging
 import os
 import pickle
@@ -73,6 +74,40 @@ from verl.workers.rollout.base import BaseRollout
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# #region agent log
+def _agentlog(*, hypothesis_id: str, location: str, message: str, data: dict | None = None):
+    """Debug-only: emit structured logs into Ray worker logs."""
+    try:
+        payload = {
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        logger.info("[AGENTLOG] %s", json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _safe_peek(obj, keys: list[str]) -> dict:
+    out = {}
+    for k in keys:
+        try:
+            v = getattr(obj, k)
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                out[k] = v
+            elif k == "token_ids" and hasattr(v, "__len__"):
+                out[k] = {"type": type(v).__name__, "len": len(v)}
+            else:
+                out[k] = type(v).__name__
+        except Exception:
+            out[k] = "ERR"
+    return out
+
+
+# #endregion agent log
 
 # TODO
 # 1. support pp in vllm
@@ -240,7 +275,24 @@ class vLLMRollout(BaseRollout):
                 branching_factor=int(_tree_cfg.get("branching_factor", 3)),
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
             )
-            logging.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
+            logger.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
+            _agentlog(
+                hypothesis_id="A",
+                location="vllm_rollout_spmd.py:TreeSearchParams",
+                message="TreeSearchParams configured",
+                data={
+                    "tree_cfg": {k: _tree_cfg.get(k) for k in ("enable", "entropy_threshold", "branching_factor", "max_tree_depth")},
+                    "sampling_has_tree": hasattr(self.sampling_params, "tree_search_params"),
+                    "sampling_tree_str": str(getattr(self.sampling_params, "tree_search_params", None))[:300],
+                },
+            )
+        else:
+            _agentlog(
+                hypothesis_id="A",
+                location="vllm_rollout_spmd.py:TreeSearchParams",
+                message="TreeSearchParams NOT enabled",
+                data={"tree_cfg_is_none": _tree_cfg is None, "tree_cfg_type": type(_tree_cfg).__name__},
+            )
 
         self.pad_token_id = tokenizer.pad_token_id
 
@@ -354,12 +406,42 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         _tree_metrics: dict = {}
         with self.update_sampling_params(**kwargs):
+            _agentlog(
+                hypothesis_id="A",
+                location="vllm_rollout_spmd.py:generate_sequences:before_generate",
+                message="About to call vLLM generate()",
+                data={
+                    "update_kwargs_keys": list(kwargs.keys())[:30],
+                    "sampling_has_tree": hasattr(self.sampling_params, "tree_search_params"),
+                    "sampling_tree_str": str(getattr(self.sampling_params, "tree_search_params", None))[:300],
+                },
+            )
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
+            try:
+                _out0 = outputs[0] if outputs else None
+                _s0 = _out0.outputs[0] if (_out0 is not None and getattr(_out0, "outputs", None)) else None
+                _agentlog(
+                    hypothesis_id="B",
+                    location="vllm_rollout_spmd.py:generate_sequences:after_generate",
+                    message="Peek vLLM output/sample for tree fields",
+                    data={
+                        "outputs_len": len(outputs) if outputs is not None else None,
+                        "out0_type": type(_out0).__name__ if _out0 is not None else None,
+                        "out0_dict_keys": list(getattr(_out0, "__dict__", {}).keys())[:50] if _out0 is not None else None,
+                        "out0_outputs_len": len(getattr(_out0, "outputs", [])) if _out0 is not None else None,
+                        "sample0_type": type(_s0).__name__ if _s0 is not None else None,
+                        "sample0_has_is_leaf": hasattr(_s0, "is_leaf") if _s0 is not None else None,
+                        "sample0_has_tree_depth": hasattr(_s0, "tree_depth") if _s0 is not None else None,
+                        "sample0_peek": _safe_peek(_s0, ["is_leaf", "tree_depth", "token_ids"]) if _s0 is not None else None,
+                    },
+                )
+            except Exception:
+                pass
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -422,10 +504,10 @@ class vLLMRollout(BaseRollout):
                 "tree/branching_rate": round(_tree_branch_pts / max(_tree_total, 1), 4),
                 "tree/avg_max_depth": round(_tree_depth_sum / max(len(outputs), 1), 4),
             }
-            logging.info(f"[TreeRollout] step metrics: {_tree_metrics}")
-            
+            logger.info(f"[TreeRollout] step metrics: {_tree_metrics}")
+
             if debug_samples:
-                logging.info(f"[TreeRollout] DEBUG INFO: {debug_samples}")
+                logger.info(f"[TreeRollout] DEBUG INFO: {debug_samples}")
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device

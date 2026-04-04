@@ -190,6 +190,20 @@ def is_correct_minerva(
     return (pred == gt), pred
 
 
+def _verify_boxed_fallback(solution_str: str, gt: str) -> tuple[bool, str]:
+    """If there is no ``Answer:`` line, use the last ``\\boxed{...}`` and compare normalized strings."""
+    boxed = last_boxed_only_string(solution_str)
+    if boxed is None:
+        return False, "[INVALID]"
+    try:
+        extracted = remove_boxed(boxed)
+    except (AssertionError, ValueError):
+        return False, "[INVALID]"
+    pred = normalize_final_answer(extracted)
+    gt_norm = normalize_final_answer(gt)
+    return (pred == gt_norm), pred
+
+
 def is_correct_strict_box(
     pred: str, gt: str, pause_tokens_index: Optional[list[int]] = None
 ) -> tuple[int, Optional[str]]:
@@ -218,25 +232,37 @@ def is_correct_strict_box(
 
 
 def verify(
-    solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: Optional[list[int]] = None
-) -> bool:
+    solution_str: str,
+    answer: str,
+    strict_box_verify: bool = False,
+    pause_tokens_index: Optional[list[int]] = None,
+    boxed_fallback: bool = True,
+) -> tuple[bool, str]:
     """Verify if the solution is correct.
 
     Args:
         solution_str: The solution string to verify
         answer: The ground truth answer
-        strict_box_verify: Whether to use strict box verification
+        strict_box_verify: Whether to use strict box verification (last 100 chars, raw ``\\boxed`` compare)
         pause_tokens_index: Indices of pause tokens
+        boxed_fallback: If True and there is no ``Answer:`` line, use last ``\\boxed{...}`` with
+            :func:`normalize_final_answer` on both prediction and ground truth.
 
     Returns:
-        True if the solution is correct, False otherwise
+        (is_correct, normalized_or_display_pred)
     """
     if strict_box_verify:
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
-        return correct == 1, pred
+        return correct == 1, pred if pred is not None else "[INVALID]"
 
-    correct, pred = is_correct_minerva(solution_str, answer)
-    return correct, pred
+    answer_pattern = r"(?i)Answer\s*:\s*([^\n]+)"
+    if re.findall(answer_pattern, solution_str):
+        return is_correct_minerva(solution_str, answer)
+
+    if boxed_fallback:
+        return _verify_boxed_fallback(solution_str, answer)
+
+    return is_correct_minerva(solution_str, answer)
 
 
 def compute_score(
@@ -244,6 +270,7 @@ def compute_score(
     ground_truth: str,
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
+    boxed_fallback: bool = True,
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -252,6 +279,7 @@ def compute_score(
         ground_truth: The ground truth answer
         strict_box_verify: Whether to use strict box verification
         pause_tokens_index: Indices of pause tokens
+        boxed_fallback: If no ``Answer:`` line, grade using last ``\\boxed{...}`` (see :func:`verify`)
 
     Returns:
         Reward score (1.0 for correct, -1.0 for incorrect)
@@ -260,7 +288,9 @@ def compute_score(
     solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
 
     # Verify the solution
-    correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
+    correct, pred = verify(
+        solution_str, ground_truth, strict_box_verify, pause_tokens_index, boxed_fallback=boxed_fallback
+    )
 
     reward = 1.0 if correct else -1.0
     acc = correct
