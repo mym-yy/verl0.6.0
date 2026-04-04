@@ -3,6 +3,7 @@ set -x
 _ORIG_HOME="${HOME}"
 
 export PYTHONUNBUFFERED=1
+export VLLM_USE_V1=0
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VERL_DEBUG_LOG_PATH=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
 export NCCL_SHM_DISABLE=1
