@@ -61,4 +61,9 @@ def get_ppo_ray_runtime_env():
     if _verl_log:
         runtime_env["env_vars"]["VERL_LOGGING_LEVEL"] = _verl_log
 
+    # Forward VLLM_USE_V1 to Ray workers so we can force V0 engine for tree decoding.
+    _vllm_use_v1 = os.environ.get("VLLM_USE_V1")
+    if _vllm_use_v1 is not None:
+        runtime_env["env_vars"]["VLLM_USE_V1"] = _vllm_use_v1
+
     return runtime_env
