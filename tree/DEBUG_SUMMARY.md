@@ -302,6 +302,49 @@ for i, meta in enumerate(seq_group_metadata_list):
 
 ---
 
+### Bug 9: `AssertionError: 2590 % 4 != 0` — batch 不能被 GPU 数整除
+
+**错误位置**: `seqlen_balancing.py:103` (由 `ray_trainer.py:_balance_batch` 调用)
+
+**错误信息**：
+```
+AssertionError: 2590 % 4 != 0
+```
+
+**原因**：
+
+训练流程中 `_balance_batch` 会把 batch 按 sequence length 均匀分配到各 GPU，要求 `batch_size % world_size == 0`。
+
+标准 `n>1` 流程中，`batch_size = train_batch_size × n`（如 96×8=768），始终能被 GPU 数整除。但 tree search 的叶子数是**不确定的**：每个 prompt 的叶子数取决于 entropy，不同 prompt 可能产生不同数量的叶子。4 个 worker 分别产生的叶子数也不同。
+
+```
+实际情况：
+  Worker 0: 24 prompts → 648 leaves
+  Worker 1: 24 prompts → 646 leaves
+  Worker 2: 24 prompts → 648 leaves
+  Worker 3: 24 prompts → 648 leaves
+  总计: 2590 leaves
+  2590 % 4 = 2 ← 不整除!
+```
+
+**修复** (`ray_trainer.py`):
+
+在 `_balance_batch` 前，trim 掉多余的 samples 使其能被 `world_size` 整除：
+
+```python
+if self.config.trainer.balance_batch:
+    world_size = self.actor_rollout_wg.world_size
+    bs = len(batch.batch)
+    remainder = bs % world_size
+    if remainder != 0:
+        batch = batch[:bs - remainder]  # 丢弃最多 world_size-1 个样本
+    self._balance_batch(batch, metrics=metrics)
+```
+
+**影响**：最多丢弃 `world_size - 1 = 3` 个样本（从 2590 中丢 2 个），损失率 < 0.1%，对训练无影响。
+
+---
+
 ## 3. 数据流全景图
 
 ```
@@ -371,7 +414,10 @@ for i, meta in enumerate(seq_group_metadata_list):
 - [x] non_tensor_batch 维度扩展
 - [x] tree metrics 跨 worker 聚合
 - [x] ppo_mini_batch_size 适配 n=1
-- [ ] **trainer batch 维度对齐（Bug 5，已写代码，待验证）**
-- [ ] 端到端训练完整跑通（reward → log_prob → policy update）
-- [ ] 移除 `print("entropy:", entropy)` debug 语句
+- [x] trainer batch 维度对齐（Bug 5 — global prompt indices 重建）
+- [x] batch 不整除 GPU 数的 trim 修复（Bug 9）
+- [x] 移除 `print("entropy:", entropy)` debug 语句
+- [x] 清理 verbose debug logs（_agentlog、DEBUG INFO）
+- [x] 新增 tree metrics 面板指标（结构/效率/响应质量）
+- [ ] **端到端训练完整跑通（reward → log_prob → advantage → policy update）**
 - [ ] 考虑提高 `gpu_memory_utilization`（当前 0.6，可能导致 KV cache preemption）
