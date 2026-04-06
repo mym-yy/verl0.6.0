@@ -482,6 +482,11 @@ class vLLMRollout(BaseRollout):
                 for k, v in non_tensor_batch.items():
                     expanded_ntb[k] = np.array([v[pi] for pi in prompt_indices], dtype=object)
                 non_tensor_batch = expanded_ntb
+                non_tensor_batch["tree_prompt_indices"] = np.array(prompt_indices)
+                # Store per-leaf counts so the trainer can reconstruct worker boundaries
+                # Format: number of leaves this worker produced (same value repeated)
+                non_tensor_batch["tree_num_leaves"] = np.array([len(response)] * len(response))
+                non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))
                 batch_size = len(response)
                 logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
 

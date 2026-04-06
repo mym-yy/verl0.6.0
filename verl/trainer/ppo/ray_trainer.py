@@ -1081,7 +1081,26 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if "tree_prompt_indices" in gen_batch_output.non_tensor_batch:
+                        # Tree search: each prompt may have a variable number of leaf responses.
+                        # Reconstruct global prompt indices from per-worker local indices.
+                        local_idx = gen_batch_output.non_tensor_batch["tree_prompt_indices"].astype(int)
+                        num_leaves = gen_batch_output.non_tensor_batch["tree_num_leaves"].astype(int)
+                        num_prompts = gen_batch_output.non_tensor_batch["tree_num_prompts"].astype(int)
+                        global_idx = np.empty_like(local_idx)
+                        prompt_offset = 0
+                        i = 0
+                        while i < len(local_idx):
+                            # Each worker chunk has the same num_leaves value repeated
+                            chunk_leaves = int(num_leaves[i])
+                            chunk_prompts = int(num_prompts[i])
+                            for j in range(i, i + chunk_leaves):
+                                global_idx[j] = local_idx[j] + prompt_offset
+                            prompt_offset += chunk_prompts
+                            i += chunk_leaves
+                        batch = batch[global_idx]
+                    else:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
