@@ -449,15 +449,36 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
+            prompt_indices = []  # Track which prompt each response belongs to
+            for out_idx, output in enumerate(outputs):
+                # For tree search: only collect leaf node responses
+                has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
+                if has_tree:
+                    leaves = [s for s in output.outputs if getattr(s, 'is_leaf', True)]
+                    if not leaves:
+                        leaves = output.outputs  # fallback
+                    samples_to_collect = leaves
+                else:
+                    samples_to_collect = output.outputs
+                for sample in samples_to_collect:
+                    response_ids = sample.token_ids
                     response.append(response_ids)
+                    prompt_indices.append(out_idx)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        for i, logprob in enumerate(sample.logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
+
+            # When tree search produces more responses than prompts,
+            # expand prompt tensors to match
+            if len(response) != batch_size:
+                prompt_indices_t = torch.tensor(prompt_indices, device=idx.device)
+                idx = idx[prompt_indices_t]
+                attention_mask = attention_mask[prompt_indices_t]
+                position_ids = position_ids[prompt_indices_t]
+                batch_size = len(response)
+                logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
 
             # === RESTORED ORIGINAL TREE METRICS + DETAILED DEBUG ===
             # This is your original logic before we simplified it.
