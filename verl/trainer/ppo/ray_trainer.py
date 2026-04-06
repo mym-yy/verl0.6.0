@@ -1050,10 +1050,15 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        # Extract tree rollout metrics and forward to wandb/logger
-                        _tree_m = gen_batch_output.meta_info.pop("tree_metrics", {})
-                        if _tree_m:
-                            metrics.update(_tree_m)
+                        # Extract tree rollout metrics (aggregated across workers) and forward to wandb/logger
+                        _agg_metrics = gen_batch_output.meta_info.pop("metrics", {})
+                        if _agg_metrics and isinstance(_agg_metrics, dict):
+                            for k, v in _agg_metrics.items():
+                                if k.startswith("tree/"):
+                                    if isinstance(v, list):
+                                        metrics[k] = sum(v) / len(v)
+                                    else:
+                                        metrics[k] = v
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:

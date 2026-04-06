@@ -579,7 +579,7 @@ class vLLMRollout(BaseRollout):
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"tree_metrics": _tree_metrics})
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": _tree_metrics})
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
