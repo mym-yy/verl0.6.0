@@ -97,7 +97,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
     trainer.project_name='verl_grpo_treerollout' \
-    trainer.experiment_name='qwen3_8b_test' \
+    trainer.experiment_name='qwen3_8b_tree_v0' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

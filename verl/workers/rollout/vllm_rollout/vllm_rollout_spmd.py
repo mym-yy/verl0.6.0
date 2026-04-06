@@ -384,6 +384,7 @@ class vLLMRollout(BaseRollout):
                 "min_p": 0.0,
                 "temperature": 0,
                 "n": 1,  # if greedy, only 1 response
+                "tree_search_params": None,  # disable tree search during validation
             }
         elif is_validate:
             # TODO: try **
