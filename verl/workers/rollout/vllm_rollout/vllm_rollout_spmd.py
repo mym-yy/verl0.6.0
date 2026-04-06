@@ -471,12 +471,17 @@ class vLLMRollout(BaseRollout):
                         rollout_log_probs.append(curr_log_prob)
 
             # When tree search produces more responses than prompts,
-            # expand prompt tensors to match
+            # expand prompt tensors and non_tensor_batch to match
             if len(response) != batch_size:
                 prompt_indices_t = torch.tensor(prompt_indices, device=idx.device)
                 idx = idx[prompt_indices_t]
                 attention_mask = attention_mask[prompt_indices_t]
                 position_ids = position_ids[prompt_indices_t]
+                # Expand non_tensor_batch so every key matches the new batch size
+                expanded_ntb = {}
+                for k, v in non_tensor_batch.items():
+                    expanded_ntb[k] = np.array([v[pi] for pi in prompt_indices], dtype=object)
+                non_tensor_batch = expanded_ntb
                 batch_size = len(response)
                 logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
 
