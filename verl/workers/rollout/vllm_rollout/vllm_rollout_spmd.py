@@ -29,7 +29,6 @@ When working with Megatron:
 import asyncio
 import getpass
 import inspect
-import json
 import logging
 import os
 import pickle
@@ -75,39 +74,6 @@ from verl.workers.rollout.base import BaseRollout
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# #region agent log
-def _agentlog(*, hypothesis_id: str, location: str, message: str, data: dict | None = None):
-    """Debug-only: emit structured logs into Ray worker logs."""
-    try:
-        payload = {
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        logger.info("[AGENTLOG] %s", json.dumps(payload, ensure_ascii=False))
-    except Exception:
-        pass
-
-
-def _safe_peek(obj, keys: list[str]) -> dict:
-    out = {}
-    for k in keys:
-        try:
-            v = getattr(obj, k)
-            if isinstance(v, (str, int, float, bool)) or v is None:
-                out[k] = v
-            elif k == "token_ids" and hasattr(v, "__len__"):
-                out[k] = {"type": type(v).__name__, "len": len(v)}
-            else:
-                out[k] = type(v).__name__
-        except Exception:
-            out[k] = "ERR"
-    return out
-
-
-# #endregion agent log
 
 # TODO
 # 1. support pp in vllm
@@ -276,23 +242,6 @@ class vLLMRollout(BaseRollout):
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
             )
             logger.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
-            _agentlog(
-                hypothesis_id="A",
-                location="vllm_rollout_spmd.py:TreeSearchParams",
-                message="TreeSearchParams configured",
-                data={
-                    "tree_cfg": {k: _tree_cfg.get(k) for k in ("enable", "entropy_threshold", "branching_factor", "max_tree_depth")},
-                    "sampling_has_tree": hasattr(self.sampling_params, "tree_search_params"),
-                    "sampling_tree_str": str(getattr(self.sampling_params, "tree_search_params", None))[:300],
-                },
-            )
-        else:
-            _agentlog(
-                hypothesis_id="A",
-                location="vllm_rollout_spmd.py:TreeSearchParams",
-                message="TreeSearchParams NOT enabled",
-                data={"tree_cfg_is_none": _tree_cfg is None, "tree_cfg_type": type(_tree_cfg).__name__},
-            )
 
         self.pad_token_id = tokenizer.pad_token_id
 
@@ -407,42 +356,12 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         _tree_metrics: dict = {}
         with self.update_sampling_params(**kwargs):
-            _agentlog(
-                hypothesis_id="A",
-                location="vllm_rollout_spmd.py:generate_sequences:before_generate",
-                message="About to call vLLM generate()",
-                data={
-                    "update_kwargs_keys": list(kwargs.keys())[:30],
-                    "sampling_has_tree": hasattr(self.sampling_params, "tree_search_params"),
-                    "sampling_tree_str": str(getattr(self.sampling_params, "tree_search_params", None))[:300],
-                },
-            )
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
-            try:
-                _out0 = outputs[0] if outputs else None
-                _s0 = _out0.outputs[0] if (_out0 is not None and getattr(_out0, "outputs", None)) else None
-                _agentlog(
-                    hypothesis_id="B",
-                    location="vllm_rollout_spmd.py:generate_sequences:after_generate",
-                    message="Peek vLLM output/sample for tree fields",
-                    data={
-                        "outputs_len": len(outputs) if outputs is not None else None,
-                        "out0_type": type(_out0).__name__ if _out0 is not None else None,
-                        "out0_dict_keys": list(getattr(_out0, "__dict__", {}).keys())[:50] if _out0 is not None else None,
-                        "out0_outputs_len": len(getattr(_out0, "outputs", [])) if _out0 is not None else None,
-                        "sample0_type": type(_s0).__name__ if _s0 is not None else None,
-                        "sample0_has_is_leaf": hasattr(_s0, "is_leaf") if _s0 is not None else None,
-                        "sample0_has_tree_depth": hasattr(_s0, "tree_depth") if _s0 is not None else None,
-                        "sample0_peek": _safe_peek(_s0, ["is_leaf", "tree_depth", "token_ids"]) if _s0 is not None else None,
-                    },
-                )
-            except Exception:
-                pass
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -490,56 +409,51 @@ class vLLMRollout(BaseRollout):
                 batch_size = len(response)
                 logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
 
-            # === RESTORED ORIGINAL TREE METRICS + DETAILED DEBUG ===
-            # This is your original logic before we simplified it.
-            _tree_total, _tree_leaves, _tree_depth_sum = 0, 0, 0
-            debug_samples = []
+            # ── Compute tree search metrics ──
+            _tree_total, _tree_leaves = 0, 0
+            _depth_sum, _depth_max = 0, 0
+            _leaves_per_prompt = []
+            _leaf_resp_lens = []
 
-            for out_idx, _out in enumerate(outputs):
+            for _out in outputs:
                 _seqs = _out.outputs
-                seq_count = len(_seqs)
-                _tree_total += seq_count
+                _tree_total += len(_seqs)
+                prompt_leaf_count = 0
+                prompt_max_depth = 0
+                for _s in _seqs:
+                    depth = getattr(_s, 'tree_depth', 0)
+                    if isinstance(depth, (int, float)):
+                        prompt_max_depth = max(prompt_max_depth, depth)
+                    if getattr(_s, 'is_leaf', True):
+                        prompt_leaf_count += 1
+                        _leaf_resp_lens.append(len(_s.token_ids))
+                _tree_leaves += prompt_leaf_count
+                _leaves_per_prompt.append(prompt_leaf_count)
+                _depth_sum += prompt_max_depth
+                _depth_max = max(_depth_max, prompt_max_depth)
 
-                leaf_count = 0
-                depths = []
-                for s_idx, _s in enumerate(_seqs):
-                    is_leaf_val = getattr(_s, 'is_leaf', 'MISSING')
-                    depth_val = getattr(_s, 'tree_depth', 'MISSING')
-                    if is_leaf_val is True or str(is_leaf_val).lower() == 'true':
-                        leaf_count += 1
-                    if isinstance(depth_val, (int, float)):
-                        depths.append(depth_val)
-
-                _tree_leaves += leaf_count
-                if depths:
-                    _tree_depth_sum += max(depths)
-
-                # Record debug for first 2 outputs
-                if out_idx < 2 and _seqs:
-                    debug_samples.append({
-                        "out_idx": out_idx,
-                        "num_seqs": seq_count,
-                        "leaf_count": leaf_count,
-                        "depths": depths[:5],  # first 5 depths
-                        "sample0": {
-                            "is_leaf": getattr(_seqs[0], 'is_leaf', 'MISSING'),
-                            "tree_depth": getattr(_seqs[0], 'tree_depth', 'MISSING'),
-                            "type": type(_seqs[0]).__name__
-                        }
-                    })
-
+            n_prompts = max(len(outputs), 1)
             _tree_branch_pts = _tree_total - _tree_leaves
+            avg_leaves = _tree_leaves / n_prompts
             _tree_metrics = {
+                # -- Structure: how large/deep is the tree? --
                 "tree/total_nodes": _tree_total,
                 "tree/leaf_nodes": _tree_leaves,
                 "tree/branch_points": _tree_branch_pts,
+                "tree/avg_max_depth": round(_depth_sum / n_prompts, 4),
+                "tree/global_max_depth": _depth_max,
+                # -- Efficiency: branching budget utilisation --
                 "tree/branching_rate": round(_tree_branch_pts / max(_tree_total, 1), 4),
-                "tree/avg_max_depth": round(_tree_depth_sum / max(len(outputs), 1), 4),
+                "tree/avg_leaves_per_prompt": round(avg_leaves, 2),
+                "tree/min_leaves_per_prompt": min(_leaves_per_prompt) if _leaves_per_prompt else 0,
+                "tree/max_leaves_per_prompt": max(_leaves_per_prompt) if _leaves_per_prompt else 0,
+                # -- Response quality signals --
+                "tree/avg_leaf_resp_len": round(sum(_leaf_resp_lens) / max(len(_leaf_resp_lens), 1), 1),
+                "tree/min_leaf_resp_len": min(_leaf_resp_lens) if _leaf_resp_lens else 0,
+                "tree/max_leaf_resp_len": max(_leaf_resp_lens) if _leaf_resp_lens else 0,
+                # -- Expansion ratio (useful for batch size planning) --
+                "tree/expansion_ratio": round(avg_leaves, 2),  # how many times batch grows
             }
-            logger.info(f"[TreeRollout] step metrics: {_tree_metrics}")
-
-            if debug_samples:
-                logger.info(f"[TreeRollout] DEBUG INFO: {debug_samples}")
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device

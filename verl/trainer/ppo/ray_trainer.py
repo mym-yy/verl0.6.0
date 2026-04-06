@@ -1054,11 +1054,18 @@ class RayPPOTrainer:
                         _agg_metrics = gen_batch_output.meta_info.pop("metrics", {})
                         if _agg_metrics and isinstance(_agg_metrics, dict):
                             for k, v in _agg_metrics.items():
-                                if k.startswith("tree/"):
-                                    if isinstance(v, list):
-                                        metrics[k] = sum(v) / len(v)
-                                    else:
-                                        metrics[k] = v
+                                if not k.startswith("tree/"):
+                                    continue
+                                if not isinstance(v, list):
+                                    metrics[k] = v
+                                elif "min" in k:
+                                    metrics[k] = min(v)
+                                elif "max" in k or "global" in k:
+                                    metrics[k] = max(v)
+                                elif "total" in k or "leaf_nodes" in k or "branch_points" in k:
+                                    metrics[k] = sum(v)  # sum across workers
+                                else:
+                                    metrics[k] = sum(v) / len(v)  # average
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
