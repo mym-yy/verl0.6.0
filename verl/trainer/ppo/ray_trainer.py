@@ -240,6 +240,71 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GRPO_TREE_SEGMENT_STRICT:
+        required_keys = [
+            "sample_prompt_ids",
+            "sample_leaf_node_ids",
+            "sample_path_nodes",
+            "sample_segment_token_spans",
+            "tree_children_row",
+            "tree_roots_row",
+            "child_old_logprob_row",
+        ]
+        missing_keys = [key for key in required_keys if key not in data.non_tensor_batch]
+        if missing_keys:
+            raise ValueError(f"Missing tree-GRPO non_tensor_batch fields: {missing_keys}")
+
+        sample_prompt_ids = data.non_tensor_batch["sample_prompt_ids"]
+        tree_children: dict = {}
+        tree_roots: dict = {}
+        child_old_logprob: dict = {}
+
+        def _to_hashable_tree_prompt(x):
+            if isinstance(x, np.generic):
+                return x.item()
+            if isinstance(x, np.ndarray):
+                if x.ndim == 0:
+                    return _to_hashable_tree_prompt(x.item())
+                return tuple(_to_hashable_tree_prompt(v) for v in x.tolist())
+            if isinstance(x, list):
+                return tuple(_to_hashable_tree_prompt(v) for v in x)
+            if isinstance(x, tuple):
+                return tuple(_to_hashable_tree_prompt(v) for v in x)
+            return x
+
+        for i, prompt in enumerate(sample_prompt_ids):
+            prompt = _to_hashable_tree_prompt(prompt)
+            children_i = data.non_tensor_batch["tree_children_row"][i]
+            root_i = data.non_tensor_batch["tree_roots_row"][i]
+            old_logprob_i = data.non_tensor_batch["child_old_logprob_row"][i]
+
+            if prompt in tree_children:
+                if tree_children[prompt] != children_i:
+                    raise ValueError(f"Inconsistent tree_children_row for prompt={prompt}")
+                if tree_roots[prompt] != root_i:
+                    raise ValueError(f"Inconsistent tree_roots_row for prompt={prompt}")
+                if child_old_logprob[prompt] != old_logprob_i:
+                    raise ValueError(f"Inconsistent child_old_logprob_row for prompt={prompt}")
+            else:
+                tree_children[prompt] = children_i
+                tree_roots[prompt] = root_i
+                child_old_logprob[prompt] = old_logprob_i
+
+        advantages, returns = core_algos.compute_grpo_tree_segment_advantage_strict(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            sample_prompt_ids=sample_prompt_ids,
+            sample_leaf_node_ids=list(data.non_tensor_batch["sample_leaf_node_ids"]),
+            sample_path_nodes=list(data.non_tensor_batch["sample_path_nodes"]),
+            sample_segment_token_spans=list(data.non_tensor_batch["sample_segment_token_spans"]),
+            tree_children=tree_children,
+            tree_roots=tree_roots,
+            child_old_logprob=child_old_logprob,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -936,6 +1001,8 @@ class RayPPOTrainer:
         """
         # Compute rollout IS weights if enabled and data is available
         # rollout_is_threshold is the main on/off switch
+        if "segment_ids" in batch.batch and self.config.algorithm.get("rollout_is", False):
+            raise ValueError("Tree rollout does not support rollout mismatch/IS in this implementation.")
         if self.config.algorithm.rollout_is_threshold is not None and "rollout_log_probs" in batch.batch:
             rollout_is_weights, rollout_is_metrics = compute_rollout_importance_weights(
                 old_log_prob=batch.batch["old_log_probs"],

@@ -91,6 +91,165 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[in
     return token_ids
 
 
+def _to_hashable_tree_id(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _to_hashable_tree_id(value.item())
+        return tuple(_to_hashable_tree_id(v) for v in value.tolist())
+    if isinstance(value, list):
+        return tuple(_to_hashable_tree_id(v) for v in value)
+    if isinstance(value, tuple):
+        return tuple(_to_hashable_tree_id(v) for v in value)
+    return value
+
+
+def _as_token_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _object_1d_array(values: list[Any]) -> np.ndarray:
+    """Build a 1D object array without NumPy inferring nested dimensions."""
+    arr = np.empty(len(values), dtype=object)
+    arr[:] = values
+    return arr
+
+
+def _build_tree_training_rows(outputs: list[Any], non_tensor_batch: dict[str, Any]) -> dict[str, Any]:
+    responses: list[list[int]] = []
+    segment_ids_rows: list[list[int]] = []
+    prompt_indices: list[int] = []
+    sample_prompt_ids: list[Any] = []
+    sample_leaf_node_ids: list[Any] = []
+    sample_path_nodes: list[list[Any]] = []
+    sample_segment_token_spans: list[list[tuple[int, int]]] = []
+    tree_children_rows: list[dict[Any, list[Any]]] = []
+    tree_roots_rows: list[Any] = []
+    child_old_logprob_rows: list[dict[tuple[Any, Any], float]] = []
+
+    for prompt_idx, output in enumerate(outputs):
+        if "uid" in non_tensor_batch:
+            prompt_id = non_tensor_batch["uid"][prompt_idx]
+        else:
+            # prompt_idx is only local to this rollout worker. Include the worker
+            # process id so tree groups do not collide after Ray gathers workers.
+            prompt_id = ("tree_prompt", os.getpid(), prompt_idx)
+        prompt_id = _to_hashable_tree_id(prompt_id)
+
+        node_map: dict[Any, dict[str, Any]] = {}
+        for sample in output.outputs:
+            seq_id = _to_hashable_tree_id(getattr(sample, "seq_id", None))
+            if seq_id is None:
+                raise ValueError(f"Tree output node is missing seq_id for prompt={prompt_id}")
+            parent_node_id = _to_hashable_tree_id(getattr(sample, "parent_seq_id", None))
+            if seq_id in node_map:
+                raise ValueError(f"Duplicate tree node seq_id={seq_id} for prompt={prompt_id}")
+            node_map[seq_id] = {
+                "node_id": seq_id,
+                "parent_node_id": parent_node_id,
+                "is_leaf": bool(getattr(sample, "is_leaf", True)),
+                "tree_ids": _as_token_list(getattr(sample, "tree_ids", None)),
+                "seq_token_ids": _as_token_list(getattr(sample, "token_ids", None)),
+                "tree_depth": int(getattr(sample, "tree_depth", 0) or 0),
+                "branch_logprob": getattr(sample, "branch_logprob", None),
+            }
+
+        roots = [node_id for node_id, node in node_map.items() if node["parent_node_id"] is None]
+        if len(roots) == 0:
+            raise ValueError(f"Missing tree root: no node with parent_seq_id is None for prompt={prompt_id}")
+        if len(roots) > 1:
+            raise ValueError(f"Multiple tree roots found for prompt={prompt_id}: {roots}")
+        root = roots[0]
+
+        tree_children: dict[Any, list[Any]] = {node_id: [] for node_id in node_map}
+        child_old_logprob: dict[tuple[Any, Any], float] = {}
+        for node_id, node in node_map.items():
+            parent = node["parent_node_id"]
+            if parent is None:
+                continue
+            if parent not in node_map:
+                raise ValueError(f"Missing parent node for prompt={prompt_id}, child={node_id}, parent={parent}")
+            branch_logprob = node["branch_logprob"]
+            if branch_logprob is None:
+                raise ValueError(
+                    f"Missing child_old_logprob for prompt={prompt_id}, parent={parent}, child={node_id}"
+                )
+            tree_children[parent].append(node_id)
+            child_old_logprob[(parent, node_id)] = float(branch_logprob)
+
+        leaves = [node_id for node_id, node in node_map.items() if node["is_leaf"]]
+        if len(leaves) == 0:
+            raise ValueError(f"Tree output has no leaf nodes for prompt={prompt_id}")
+
+        for leaf in leaves:
+            path_nodes = []
+            current = leaf
+            while True:
+                path_nodes.append(current)
+                if current == root:
+                    break
+                parent = node_map[current]["parent_node_id"]
+                if parent is None or parent not in node_map:
+                    raise ValueError(f"Invalid tree path for prompt={prompt_id}, leaf={leaf}")
+                current = parent
+            path_nodes.reverse()
+
+            tree_response: list[int] = []
+            spans: list[tuple[int, int]] = []
+            cursor = 0
+            if len(path_nodes) == 1:
+                # The sampler can occasionally return an unbranched tree where
+                # the root is also the only leaf. Keep the response, but leave
+                # spans empty because there is no parent->child tree segment.
+                tree_response = node_map[leaf]["seq_token_ids"]
+            else:
+                for child in path_nodes[1:]:
+                    seg_tokens = node_map[child]["tree_ids"]
+                    if len(seg_tokens) == 0:
+                        raise ValueError("Invalid tree segment: child tree_ids is empty")
+                    start = cursor
+                    tree_response.extend(seg_tokens)
+                    cursor += len(seg_tokens)
+                    spans.append((start, cursor))
+
+            segment_ids_row = [-1] * len(tree_response)
+            for seg_id, (start, end) in enumerate(spans):
+                segment_ids_row[start:end] = [seg_id] * (end - start)
+
+            responses.append(tree_response)
+            segment_ids_rows.append(segment_ids_row)
+            prompt_indices.append(prompt_idx)
+            sample_prompt_ids.append(prompt_id)
+            sample_leaf_node_ids.append(leaf)
+            sample_path_nodes.append(path_nodes)
+            sample_segment_token_spans.append(spans)
+            tree_children_rows.append(tree_children)
+            tree_roots_rows.append(root)
+            child_old_logprob_rows.append(child_old_logprob)
+
+    return {
+        "responses": responses,
+        "segment_ids_rows": segment_ids_rows,
+        "prompt_indices": prompt_indices,
+        "sample_prompt_ids": sample_prompt_ids,
+        "sample_leaf_node_ids": sample_leaf_node_ids,
+        "sample_path_nodes": sample_path_nodes,
+        "sample_segment_token_spans": sample_segment_token_spans,
+        "tree_children_rows": tree_children_rows,
+        "tree_roots_rows": tree_roots_rows,
+        "child_old_logprob_rows": child_old_logprob_rows,
+    }
+
+
 if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
@@ -366,30 +525,45 @@ class vLLMRollout(BaseRollout):
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-            response = []
+            tree_params = getattr(self.sampling_params, "tree_search_params", None)
+            tree_mode = bool(tree_params is not None and getattr(tree_params, "enable_tree_search", False))
             rollout_log_probs = []
-            prompt_indices = []  # Track which prompt each response belongs to
-            for out_idx, output in enumerate(outputs):
-                # For tree search: only collect leaf node responses
-                has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
-                if has_tree:
-                    leaves = [s for s in output.outputs if getattr(s, 'is_leaf', True)]
-                    if not leaves:
-                        leaves = output.outputs  # fallback
-                    samples_to_collect = leaves
-                else:
-                    samples_to_collect = output.outputs
-                for sample in samples_to_collect:
-                    response_ids = sample.token_ids
-                    response.append(response_ids)
-                    prompt_indices.append(out_idx)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(sample.logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+            segment_ids = None
+            tree_non_tensor_batch = {}
+            if tree_mode:
+                tree_rows = _build_tree_training_rows(outputs, non_tensor_batch)
+                response = tree_rows["responses"]
+                prompt_indices = tree_rows["prompt_indices"]
+                tree_non_tensor_batch["sample_prompt_ids"] = _object_1d_array(tree_rows["sample_prompt_ids"])
+                tree_non_tensor_batch["sample_leaf_node_ids"] = _object_1d_array(tree_rows["sample_leaf_node_ids"])
+                tree_non_tensor_batch["sample_path_nodes"] = _object_1d_array(tree_rows["sample_path_nodes"])
+                tree_non_tensor_batch["sample_segment_token_spans"] = _object_1d_array(
+                    tree_rows["sample_segment_token_spans"]
+                )
+                tree_non_tensor_batch["tree_children_row"] = _object_1d_array(tree_rows["tree_children_rows"])
+                tree_non_tensor_batch["tree_roots_row"] = _object_1d_array(tree_rows["tree_roots_rows"])
+                tree_non_tensor_batch["child_old_logprob_row"] = _object_1d_array(
+                    tree_rows["child_old_logprob_rows"]
+                )
+                segment_ids = pad_2d_list_to_length(
+                    tree_rows["segment_ids_rows"], -1, max_length=self.config.response_length
+                ).to(idx.device)
+                segment_ids = segment_ids.to(torch.int64)
+            else:
+                response = []
+                prompt_indices = []  # Track which prompt each response belongs to
+                for out_idx, output in enumerate(outputs):
+                    for sample in output.outputs:
+                        response_ids = sample.token_ids
+                        response.append(response_ids)
+                        prompt_indices.append(out_idx)
+                        if self.config.calculate_log_probs:
+                            curr_log_prob = []
+                            for i, logprob in enumerate(sample.logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
 
-            # When tree search produces more responses than prompts,
+            # When generation produces more responses than prompts,
             # expand prompt tensors and non_tensor_batch to match
             if len(response) != batch_size:
                 prompt_indices_t = torch.tensor(prompt_indices, device=idx.device)
@@ -399,7 +573,7 @@ class vLLMRollout(BaseRollout):
                 # Expand non_tensor_batch so every key matches the new batch size
                 expanded_ntb = {}
                 for k, v in non_tensor_batch.items():
-                    expanded_ntb[k] = np.array([v[pi] for pi in prompt_indices], dtype=object)
+                    expanded_ntb[k] = _object_1d_array([v[pi] for pi in prompt_indices])
                 non_tensor_batch = expanded_ntb
                 non_tensor_batch["tree_prompt_indices"] = np.array(prompt_indices)
                 # Store per-leaf counts so the trainer can reconstruct worker boundaries
@@ -408,6 +582,8 @@ class vLLMRollout(BaseRollout):
                 non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))
                 batch_size = len(response)
                 logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
+            if tree_mode:
+                non_tensor_batch.update(tree_non_tensor_batch)
 
             # ── Compute tree search metrics ──
             _tree_total, _tree_leaves = 0, 0
@@ -458,7 +634,7 @@ class vLLMRollout(BaseRollout):
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
             )
-            if self.config.calculate_log_probs:
+            if self.config.calculate_log_probs and not tree_mode:
                 rollout_log_probs = pad_2d_list_to_length(
                     rollout_log_probs, -1, max_length=self.config.response_length
                 ).to(idx.device)
@@ -491,10 +667,13 @@ class vLLMRollout(BaseRollout):
                 "input_ids": seq,  # here input_ids become the whole sentences
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
+                "response_mask": response_attention_mask,
             },
             batch_size=batch_size,
         )
-        if self.config.calculate_log_probs:
+        if segment_ids is not None:
+            batch["segment_ids"] = segment_ids
+        if self.config.calculate_log_probs and segment_ids is None:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
 

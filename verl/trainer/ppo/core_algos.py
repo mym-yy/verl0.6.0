@@ -20,7 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -43,6 +43,7 @@ PolicyLossFn = Callable[
         str,  # loss_agg_mode
         Optional[DictConfig | AlgoConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # segment_ids
     ],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]
@@ -105,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    GRPO_TREE_SEGMENT_STRICT = "grpo_tree_segment_strict"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -326,6 +328,212 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.GRPO_TREE_SEGMENT_STRICT)
+def compute_grpo_tree_segment_advantage_strict(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    sample_prompt_ids: np.ndarray,
+    sample_leaf_node_ids: list[Any],
+    sample_path_nodes: list[list[Any]],
+    sample_segment_token_spans: list[list[tuple[int, int]]],
+    tree_children: dict[Any, dict[Any, list[Any]]],
+    tree_roots: dict[Any, Any],
+    child_old_logprob: dict[Any, dict[tuple[Any, Any], float]],
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del config
+
+    def _to_hashable(x: Any) -> Any:
+        if isinstance(x, np.generic):
+            return x.item()
+        if isinstance(x, np.ndarray):
+            if x.ndim == 0:
+                return _to_hashable(x.item())
+            return tuple(_to_hashable(v) for v in x.tolist())
+        if isinstance(x, list):
+            return tuple(_to_hashable(v) for v in x)
+        if isinstance(x, tuple):
+            return tuple(_to_hashable(v) for v in x)
+        return x
+
+    def _bfs_nodes_and_depth(root: Any, child_map: dict[Any, list[Any]]) -> tuple[list[Any], dict[Any, int]]:
+        q = deque([(root, 0)])
+        seen = set()
+        nodes = []
+        depth = {}
+        while q:
+            node, d = q.popleft()
+            if node in seen:
+                continue
+            seen.add(node)
+            nodes.append(node)
+            depth[node] = d
+            for child in child_map.get(node, []):
+                q.append((child, d + 1))
+        return nodes, depth
+
+    def _leaf_set(root: Any, child_map: dict[Any, list[Any]]) -> set[Any]:
+        nodes, _ = _bfs_nodes_and_depth(root, child_map)
+        return {node for node in nodes if len(child_map.get(node, [])) == 0}
+
+    def _validate_path(prompt: Any, root: Any, child_map: dict[Any, list[Any]], path: list[Any], leaf: Any) -> None:
+        if len(path) == 0:
+            raise ValueError(f"Empty path for prompt={prompt}, leaf={leaf}")
+        if path[0] != root:
+            raise ValueError(f"Path must start from root. prompt={prompt}, expected_root={root}, got={path[0]}")
+        if path[-1] != leaf:
+            raise ValueError(f"Path must end at leaf. prompt={prompt}, expected_leaf={leaf}, got={path[-1]}")
+        for parent, child in zip(path[:-1], path[1:]):
+            if child not in child_map.get(parent, []):
+                raise ValueError(f"Invalid edge ({parent}->{child}) in path for prompt={prompt}")
+
+    def _group_mean_std(vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mean = vals.mean()
+        std = torch.sqrt(((vals - mean) ** 2).mean() + epsilon)
+        return mean, std
+
+    with torch.no_grad():
+        if token_level_rewards.ndim != 2:
+            raise ValueError("token_level_rewards must be 2D: (bs, response_length)")
+        if response_mask.shape != token_level_rewards.shape:
+            raise ValueError("response_mask must have the same shape as token_level_rewards")
+
+        bs, response_length = token_level_rewards.shape
+        device = token_level_rewards.device
+        dtype = token_level_rewards.dtype
+
+        if len(sample_leaf_node_ids) != bs:
+            raise ValueError(f"len(sample_leaf_node_ids)={len(sample_leaf_node_ids)} != bs={bs}")
+        if len(sample_path_nodes) != bs:
+            raise ValueError(f"len(sample_path_nodes)={len(sample_path_nodes)} != bs={bs}")
+        if len(sample_segment_token_spans) != bs:
+            raise ValueError(f"len(sample_segment_token_spans)={len(sample_segment_token_spans)} != bs={bs}")
+
+        seq_rewards = (token_level_rewards * response_mask).sum(dim=-1)
+        prompt_to_leaf_value: dict[Any, dict[Any, torch.Tensor]] = defaultdict(dict)
+        prompt_to_rows: dict[Any, list[int]] = defaultdict(list)
+
+        for i in range(bs):
+            prompt = _to_hashable(sample_prompt_ids[i])
+            leaf = _to_hashable(sample_leaf_node_ids[i])
+            if leaf in prompt_to_leaf_value[prompt]:
+                raise ValueError(f"Duplicate sampled leaf in strict mode: prompt={prompt}, leaf={leaf}")
+            prompt_to_leaf_value[prompt][leaf] = seq_rewards[i]
+            prompt_to_rows[prompt].append(i)
+
+        for prompt, row_ids in prompt_to_rows.items():
+            if prompt not in tree_children:
+                raise ValueError(f"Missing tree_children for prompt={prompt}")
+            if prompt not in tree_roots:
+                raise ValueError(f"Missing tree_roots for prompt={prompt}")
+            if prompt not in child_old_logprob:
+                raise ValueError(f"Missing child_old_logprob for prompt={prompt}")
+
+            root = tree_roots[prompt]
+            child_map = tree_children[prompt]
+            expected_leaves = _leaf_set(root, child_map)
+            observed_leaves = set(prompt_to_leaf_value[prompt].keys())
+            if observed_leaves != expected_leaves:
+                missing = sorted(list(expected_leaves - observed_leaves), key=str)
+                extra = sorted(list(observed_leaves - expected_leaves), key=str)
+                raise ValueError(
+                    f"Strict leaf coverage violated for prompt={prompt}. "
+                    f"missing_leaves={missing}, extra_leaves={extra}"
+                )
+
+            for i in row_ids:
+                path = [_to_hashable(x) for x in sample_path_nodes[i]]
+                leaf = _to_hashable(sample_leaf_node_ids[i])
+                spans = sample_segment_token_spans[i]
+                _validate_path(prompt, root, child_map, path, leaf)
+                if len(spans) != len(path) - 1:
+                    raise ValueError(
+                        f"sample_segment_token_spans[{i}] length must equal len(sample_path_nodes[{i}]) - 1"
+                    )
+                for start, end in spans:
+                    if not (0 <= start < end <= response_length):
+                        raise ValueError(
+                            f"Invalid token span ({start}, {end}) for sample={i}, "
+                            f"response_length={response_length}"
+                        )
+
+        node_value: dict[Any, dict[Any, torch.Tensor]] = defaultdict(dict)
+        for prompt, leaf_map in prompt_to_leaf_value.items():
+            for leaf, value in leaf_map.items():
+                node_value[prompt][leaf] = value
+
+        for prompt in prompt_to_rows.keys():
+            root = tree_roots[prompt]
+            child_map = tree_children[prompt]
+            nodes, depth = _bfs_nodes_and_depth(root, child_map)
+            for node in sorted(nodes, key=lambda n: depth[n], reverse=True):
+                children = child_map.get(node, [])
+                if len(children) == 0:
+                    continue
+
+                child_vals = []
+                edge_logprobs = []
+                for child in children:
+                    if child not in node_value[prompt]:
+                        raise ValueError(
+                            f"Missing child value during backup: prompt={prompt}, parent={node}, child={child}"
+                        )
+                    edge_key = (node, child)
+                    if edge_key not in child_old_logprob[prompt]:
+                        raise ValueError(
+                            f"Missing child_old_logprob for prompt={prompt}, parent={node}, child={child}"
+                        )
+                    child_vals.append(node_value[prompt][child])
+                    edge_logprobs.append(child_old_logprob[prompt][edge_key])
+
+                child_vals_t = torch.stack(child_vals)
+                logp_tensor = torch.tensor(edge_logprobs, device=device, dtype=dtype)
+                weights_t = torch.softmax(logp_tensor, dim=0)
+                node_value[prompt][node] = torch.sum(weights_t * child_vals_t)
+
+        segment_reward: dict[tuple[Any, Any, Any], torch.Tensor] = {}
+        sibling_groups: dict[tuple[Any, Any], list[tuple[Any, Any, Any]]] = defaultdict(list)
+        for prompt in prompt_to_rows.keys():
+            child_map = tree_children[prompt]
+            for parent, children in child_map.items():
+                if len(children) == 0:
+                    continue
+                if parent not in node_value[prompt]:
+                    raise ValueError(f"Missing node value for parent={parent}, prompt={prompt}")
+                for child in children:
+                    if child not in node_value[prompt]:
+                        raise ValueError(f"Missing node value for child={child}, prompt={prompt}")
+                    edge_key = (prompt, parent, child)
+                    segment_reward[edge_key] = node_value[prompt][child] - node_value[prompt][parent]
+                    sibling_groups[(prompt, parent)].append(edge_key)
+
+        normalized_segment_reward: dict[tuple[Any, Any, Any], torch.Tensor] = {}
+        for edge_keys in sibling_groups.values():
+            vals = torch.stack([segment_reward[e] for e in edge_keys])
+            mean, std = _group_mean_std(vals)
+            normed = (vals - mean) / std if norm_adv_by_std_in_grpo else vals - mean
+            for edge_key, val in zip(edge_keys, normed):
+                normalized_segment_reward[edge_key] = val
+
+        advantages = torch.zeros_like(token_level_rewards)
+        for i in range(bs):
+            prompt = _to_hashable(sample_prompt_ids[i])
+            path = [_to_hashable(x) for x in sample_path_nodes[i]]
+            spans = sample_segment_token_spans[i]
+            for j, (start, end) in enumerate(spans):
+                edge_key = (prompt, path[j], path[j + 1])
+                if edge_key not in normalized_segment_reward:
+                    raise ValueError(f"Missing normalized segment reward for edge {edge_key}")
+                advantages[i, start:end] = normalized_segment_reward[edge_key]
+
+        advantages = advantages * response_mask
+        returns = advantages.clone()
+
+    return advantages, returns
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
@@ -965,6 +1173,76 @@ def compute_policy_loss_vanilla(
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss("segment_clip_higher")
+def compute_policy_loss_segment_clip_higher(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    segment_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del loss_agg_mode
+    if rollout_is_weights is not None:
+        raise ValueError("segment_clip_higher does not support rollout mismatch/IS in this implementation.")
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    if segment_ids is None:
+        raise ValueError("segment_clip_higher requires segment_ids.")
+
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    if segment_ids.shape != response_mask.shape:
+        raise ValueError(
+            f"segment_ids shape {tuple(segment_ids.shape)} must match response_mask {tuple(response_mask.shape)}"
+        )
+
+    valid_token_mask = response_mask.bool() & (segment_ids >= 0)
+    seg_losses1: list[torch.Tensor] = []
+    seg_losses2: list[torch.Tensor] = []
+    seg_clip_indicators: list[torch.Tensor] = []
+
+    for i in range(response_mask.shape[0]):
+        row_seg_ids = segment_ids[i]
+        row_valid = valid_token_mask[i]
+        if not row_valid.any():
+            continue
+        for sid in torch.unique(row_seg_ids[row_valid]).tolist():
+            seg_mask = row_valid & (row_seg_ids == sid)
+            if not seg_mask.any():
+                continue
+            seg_log_ratio = negative_approx_kl[i][seg_mask].sum()
+            seg_log_ratio = torch.clamp(seg_log_ratio, min=-20.0, max=20.0)
+            seg_ratio = torch.exp(seg_log_ratio)
+            seg_ratio_clipped = torch.clamp(seg_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+            seg_adv = advantages[i][seg_mask].mean()
+
+            loss1 = -seg_adv * seg_ratio
+            loss2 = -seg_adv * seg_ratio_clipped
+            seg_losses1.append(loss1)
+            seg_losses2.append(loss2)
+            seg_clip_indicators.append((loss2 > loss1).float())
+
+    if len(seg_losses1) == 0:
+        zero_loss = (log_prob * 0.0).sum()
+        zero_clipfrac = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
+        return zero_loss, zero_clipfrac, ppo_kl, zero_clipfrac
+
+    losses1_t = torch.stack(seg_losses1)
+    losses2_t = torch.stack(seg_losses2)
+    pg_loss = torch.maximum(losses1_t, losses2_t).mean()
+    pg_clipfrac = torch.stack(seg_clip_indicators).mean()
+    pg_clipfrac_lower = torch.zeros_like(pg_clipfrac)
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 

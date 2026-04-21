@@ -31,6 +31,14 @@ package_name = "vllm"
 package_version = get_version(package_name)
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
+parsed_package_version = vs.parse(package_version) if package_version is not None else None
+
+
+def _import_vllm_symbols():
+    from vllm import LLM
+    from vllm.distributed import parallel_state
+
+    return LLM, parallel_state
 
 if package_version is None:
     if not is_sglang_available():
@@ -41,16 +49,20 @@ if package_version is None:
 elif is_npu_available:
     # sleep_mode=2 is not supported on vllm-ascend for now, will remove this restriction when this ability is ready.
     VLLM_SLEEP_LEVEL = 1
-    from vllm import LLM
-    from vllm.distributed import parallel_state
-elif vs.parse(package_version) >= vs.parse("0.7.0"):
+    LLM, parallel_state = _import_vllm_symbols()
+elif parsed_package_version >= vs.parse("0.7.0"):
     vllm_version = package_version
-    if vs.parse(package_version) >= vs.parse("0.8.5"):
+    if parsed_package_version >= vs.parse("0.8.5"):
         VLLM_SLEEP_LEVEL = 2
-    from vllm import LLM
-    from vllm.distributed import parallel_state
+    LLM, parallel_state = _import_vllm_symbols()
+elif getattr(parsed_package_version, "is_devrelease", False):
+    # Local source builds can expose a placeholder dev version such as
+    # 0.1.dev..., while still providing the modern vLLM APIs used by verl.
+    vllm_version = package_version
+    VLLM_SLEEP_LEVEL = 1
+    LLM, parallel_state = _import_vllm_symbols()
 else:
-    if vs.parse(package_version) in [vs.parse("0.5.4"), vs.parse("0.6.3")]:
+    if parsed_package_version in [vs.parse("0.5.4"), vs.parse("0.6.3")]:
         raise ValueError(
             f"vLLM version {package_version} support has been removed. vLLM 0.5.4 and 0.6.3 are no longer "
             f"supported. Please use vLLM 0.7.0 or later."

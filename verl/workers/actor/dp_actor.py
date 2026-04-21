@@ -377,6 +377,8 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "segment_ids" in data.batch.keys():
+            select_keys.append("segment_ids")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -449,7 +451,7 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    policy_loss_kwargs = dict(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -458,6 +460,9 @@ class DataParallelPPOActor(BasePPOActor):
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )
+                    if loss_mode == "segment_clip_higher":
+                        policy_loss_kwargs["segment_ids"] = model_inputs.get("segment_ids", None)
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**policy_loss_kwargs)
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

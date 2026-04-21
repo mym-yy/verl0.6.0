@@ -69,7 +69,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+    policy_loss_kwargs = dict(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -77,6 +77,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
     )
+    if loss_mode == "segment_clip_higher":
+        policy_loss_kwargs["segment_ids"] = data.get("segment_ids", None)
+    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**policy_loss_kwargs)
 
     metrics.update(
         {
