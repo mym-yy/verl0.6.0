@@ -10,12 +10,18 @@ export VERL_DEBUG_LOG_PATH=/root/autodl-tmp/debug_log
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/root/autodl-tmp
-project_name=verl_grpo_treerollout_segment
-experiment_name=qwen2.5_7b_instruct_tree_grpo_segment
+project_name=verl_grpo_tree_rollout_segment
+experiment_name=qwen2.5_7b_instruct_segment_04230042
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/data"}
 
-TRAIN_FILE=/root/autodl-tmp/data/dapo-math-17k/data/dapo-math-17k.parquet
+TRAIN_FILE=/root/autodl-tmp/data/dapo-math-17k/dapo-math-17k-verl.parquet
 TEST_FILE=/root/autodl-tmp/data/aime-2024/aime-2024-verl.parquet
+
+if [[ ! -f "${TRAIN_FILE}" ]]; then
+  echo "ERROR: converted train parquet is missing: ${TRAIN_FILE}" >&2
+  echo "Run: python3 /root/autodl-tmp/verl0.6.0/tree/prepare_dapo_math_verl.py" >&2
+  exit 1
+fi
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
 LOG_DIR="${HOME}/logs"
@@ -79,6 +85,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
@@ -92,6 +99,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=2 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
