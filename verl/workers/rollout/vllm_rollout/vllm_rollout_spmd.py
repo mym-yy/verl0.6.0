@@ -190,6 +190,8 @@ def _build_tree_training_rows(outputs: list[Any], non_tensor_batch: dict[str, An
         if len(leaves) == 0:
             raise ValueError(f"Tree output has no leaf nodes for prompt={prompt_id}")
 
+        path_nodes_by_leaf: dict[Any, list[Any]] = {}
+        observed_nodes: set[Any] = set()
         for leaf in leaves:
             path_nodes = []
             current = leaf
@@ -202,6 +204,26 @@ def _build_tree_training_rows(outputs: list[Any], non_tensor_batch: dict[str, An
                     raise ValueError(f"Invalid tree path for prompt={prompt_id}, leaf={leaf}")
                 current = parent
             path_nodes.reverse()
+            path_nodes_by_leaf[leaf] = path_nodes
+            observed_nodes.update(path_nodes)
+
+        # Keep strict coverage local to the subtree that actually produced
+        # training rows. vLLM can return tree nodes whose leaf responses are not
+        # materialized in outputs; carrying those leaves into metadata would make
+        # the strict advantage checker expect rows that do not exist.
+        tree_children_observed: dict[Any, list[Any]] = {node_id: [] for node_id in observed_nodes}
+        child_old_logprob_observed: dict[tuple[Any, Any], float] = {}
+        for parent, children in tree_children.items():
+            if parent not in observed_nodes:
+                continue
+            for child in children:
+                if child not in observed_nodes:
+                    continue
+                tree_children_observed[parent].append(child)
+                child_old_logprob_observed[(parent, child)] = child_old_logprob[(parent, child)]
+
+        for leaf in leaves:
+            path_nodes = path_nodes_by_leaf[leaf]
 
             tree_response: list[int] = []
             spans: list[tuple[int, int]] = []
@@ -232,9 +254,9 @@ def _build_tree_training_rows(outputs: list[Any], non_tensor_batch: dict[str, An
             sample_leaf_node_ids.append(leaf)
             sample_path_nodes.append(path_nodes)
             sample_segment_token_spans.append(spans)
-            tree_children_rows.append(tree_children)
+            tree_children_rows.append(tree_children_observed)
             tree_roots_rows.append(root)
-            child_old_logprob_rows.append(child_old_logprob)
+            child_old_logprob_rows.append(child_old_logprob_observed)
 
     return {
         "responses": responses,

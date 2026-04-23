@@ -434,7 +434,21 @@ def compute_grpo_tree_segment_advantage_strict(
                 raise ValueError(f"Missing child_old_logprob for prompt={prompt}")
 
             root = tree_roots[prompt]
-            child_map = tree_children[prompt]
+            child_map_full = tree_children[prompt]
+            observed_nodes = {root}
+            observed_edges = set()
+            for i in row_ids:
+                path = [_to_hashable(x) for x in sample_path_nodes[i]]
+                observed_nodes.update(path)
+                observed_edges.update(zip(path[:-1], path[1:]))
+
+            child_map = {node: [] for node in observed_nodes}
+            for parent, child in observed_edges:
+                child_map.setdefault(parent, [])
+                child_map.setdefault(child, [])
+                child_map[parent].append(child)
+            tree_children[prompt] = child_map
+
             expected_leaves = _leaf_set(root, child_map)
             observed_leaves = set(prompt_to_leaf_value[prompt].keys())
             if observed_leaves != expected_leaves:
@@ -449,6 +463,7 @@ def compute_grpo_tree_segment_advantage_strict(
                 path = [_to_hashable(x) for x in sample_path_nodes[i]]
                 leaf = _to_hashable(sample_leaf_node_ids[i])
                 spans = sample_segment_token_spans[i]
+                _validate_path(prompt, root, child_map_full, path, leaf)
                 _validate_path(prompt, root, child_map, path, leaf)
                 if len(spans) != len(path) - 1:
                     raise ValueError(
