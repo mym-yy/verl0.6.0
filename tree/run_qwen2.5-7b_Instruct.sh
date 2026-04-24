@@ -58,6 +58,7 @@ export WANDB_KEY="${WANDB_API_KEY}"
 
 # wandb online mode: upload metrics to W&B while keeping local run files here.
 export WANDB_MODE=online
+export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export WANDB_DIR="${HOME}/wandb"
 mkdir -p "${WANDB_DIR}"
 
@@ -95,9 +96,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.tree_search.enable=True \
-    actor_rollout_ref.rollout.tree_search.entropy_threshold=1 \
-    actor_rollout_ref.rollout.tree_search.branching_factor=2 \
-    actor_rollout_ref.rollout.tree_search.max_tree_depth=2 \
+    actor_rollout_ref.rollout.tree_search.entropy_threshold=1.5 \
+    actor_rollout_ref.rollout.tree_search.branching_factor=3 \
+    actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -116,7 +117,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=20 \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=2 \
     trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
     trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
