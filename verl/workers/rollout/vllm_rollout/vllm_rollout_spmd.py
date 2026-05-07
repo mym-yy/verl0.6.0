@@ -523,6 +523,7 @@ class vLLMRollout(BaseRollout):
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
+                "tree_search_params": None,  # pass@k validation should measure plain sampled decoding
             }
 
         lora_requests = None

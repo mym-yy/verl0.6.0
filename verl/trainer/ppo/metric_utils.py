@@ -379,6 +379,11 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def _should_compute_pass_metric(var_name: str) -> bool:
+    """Return whether pass@k is meaningful for this validation variable."""
+    return var_name in {"acc", "score"}
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -409,6 +414,7 @@ def process_validation_metrics(
         Where metric_name includes:
         - "mean@N": Mean value across N samples
         - "std@N": Standard deviation across N samples
+        - "pass@N": Fraction of prompts with at least one positive sample among N samples
         - "best@N/mean": Mean of the best values in bootstrap samples of size N
         - "best@N/std": Standard deviation of the best values in bootstrap samples
         - "worst@N/mean": Mean of the worst values in bootstrap samples
@@ -442,6 +448,8 @@ def process_validation_metrics(
                 metric = {}
                 n_resps = len(var_vals)
                 metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                if _should_compute_pass_metric(var_name):
+                    metric[f"pass@{n_resps}"] = float(np.max(var_vals) > 0)
 
                 if n_resps > 1:
                     metric[f"std@{n_resps}"] = np.std(var_vals)

@@ -319,6 +319,19 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_pass_at_k(self):
+        """Test exact pass@k with repeated samples from one prompt."""
+        data_sources = ["source1"] * 4
+        sample_inputs = ["prompt1"] * 4
+        infos_dict = {
+            "acc": [0.0, 0.0, 1.0, 0.0],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("pass@4", result["source1"]["acc"])
+        self.assertAlmostEqual(result["source1"]["acc"]["pass@4"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

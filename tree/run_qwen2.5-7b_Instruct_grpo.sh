@@ -10,8 +10,8 @@ export VERL_DEBUG_LOG_PATH=/root/autodl-tmp/debug_log
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/root/autodl-tmp
-project_name=verl_grpo_tree_rollout_segment
-experiment_name=qwen2.5_7b_instruct_segment_04230042
+project_name=verl_grpo_plain
+experiment_name=qwen2.5_7b_instruct_grpo_plain
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/data"}
 
 TRAIN_FILE=/root/autodl-tmp/data/dapo-math-17k/dapo-math-17k-verl.parquet
@@ -23,7 +23,6 @@ if [[ ! -f "${TRAIN_FILE}" ]]; then
   exit 1
 fi
 
-# Real-time log file: each line is written immediately; data is not lost if the job is killed
 LOG_DIR="${HOME}/logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
@@ -31,9 +30,6 @@ LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 echo "=== Training started at $(date) ===" | tee -a "${LOG_FILE}"
 echo "Log file: ${LOG_FILE}" | tee -a "${LOG_FILE}"
 
-
-# WANDB: must be set before Ray (no TTY). Order matters — do not `exit 1` before loading key.
-# 1) already exported in shell  2) ${_ORIG_HOME}/.wandb_api_key (e.g. /root/.wandb_api_key)  3) ${HOME}/.wandb_api_key (project dir)
 if [[ -z "${WANDB_API_KEY:-}" ]]; then
   for _wandb_keyfile in "${_ORIG_HOME}/.wandb_api_key" "${HOME}/.wandb_api_key"; do
     if [[ -f "${_wandb_keyfile}" ]]; then
@@ -42,9 +38,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
     fi
   done
 fi
-# Local testing only: put your key here if you do not use env / ~/.wandb_api_key.
-# Priority: shell export > key files above > this line (empty = skip).
-# Do not commit real keys to shared repos.
+
 _WANDB_API_KEY_INLINE="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"
 if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
   export WANDB_API_KEY="${_WANDB_API_KEY_INLINE}"
@@ -56,14 +50,13 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
 fi
 export WANDB_KEY="${WANDB_API_KEY}"
 
-# wandb online mode: upload metrics to W&B while keeping local run files here.
 export WANDB_MODE=online
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export WANDB_DIR="${HOME}/wandb"
 mkdir -p "${WANDB_DIR}"
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo_tree_segment_strict \
+    algorithm.adv_estimator=grpo \
     algorithm.rollout_is=False \
     algorithm.rollout_is_threshold=null \
     data.train_files="$TRAIN_FILE" \
@@ -76,7 +69,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=/root/autodl-tmp/models/Qwen2.5-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.policy_loss.loss_mode=segment_clip_higher \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -93,12 +85,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
-    actor_rollout_ref.rollout.n=1 \
+    actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.calculate_log_probs=False \
-    actor_rollout_ref.rollout.tree_search.enable=True \
-    actor_rollout_ref.rollout.tree_search.entropy_threshold=1.5 \
-    actor_rollout_ref.rollout.tree_search.branching_factor=3 \
-    actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -120,9 +108,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=2 \
     trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
     trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
-    actor_rollout_ref.rollout.val_kwargs.n=4 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-    actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
-    $@ 2>&1 | tee -a "${LOG_FILE}"
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
+    "$@" 2>&1 | tee -a "${LOG_FILE}"
